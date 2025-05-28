@@ -38,7 +38,43 @@ const DEFAULT_SETTINGS = {
   enableWhitelisting: true,
   filterDMs: true,
   allowNonMessageNotifications: false,
+  useCustomNotificationSound: false,
+  customNotificationSoundBytes: [],
+  displayCustomToaster: false,
 };
+
+
+/**
+ * @param {Uint8Array} array 
+ */
+function playByteArrayAsAudio(array) {
+  let _playByteArrayAsAudio_context = new AudioContext();
+    _playByteArrayAsAudio_context.decodeAudioData(array.slice(0).buffer, function (audioBuffer) { /* We duplicate the array with slice, or else we get an error 'Cannot decode detached ArrayBuffer' the second time we try using it to play audio */
+        let source = _playByteArrayAsAudio_context.createBufferSource();
+        source.connect(_playByteArrayAsAudio_context.destination);
+        source.buffer = audioBuffer;
+        source.start(0);
+    });
+}
+
+/**
+ * @param {Uint8Array} array 
+ * @return {String}
+ */
+function arrayBufferToString(array) {
+  return JSON.stringify(Array.from(array));
+}
+
+/**
+ * @param {String} str
+ * @return {Uint8Array}
+ */
+function stringToArrayBuffer(str) {
+  const array = JSON.parse(str);
+  const uint8Array = new Uint8Array(array);
+  return uint8Array;
+}
+
 
 module.exports = class {
   constructor() {
@@ -201,6 +237,9 @@ module.exports = class {
         );
       })
     );
+    // @note Using service workers, we would be able to create interactive messages (say, to add a button to all notifications that lets you quickly remove a user from the whitelist, or add him to the blacklist depending on the situation), however, I am not sure how this would be done in the context of BetterDiscord 
+    // navigator.serviceWorker.register("sw.js");
+
 
     // Patch the showNotification function to intercept notifications if they are not whitelisted while whitelisting is enabled.
     BdApi.Patcher.instead(
@@ -208,8 +247,53 @@ module.exports = class {
       this.modules.notifModule,
       "showNotification",
       (_, args, orig) => {
-        if (!this.settings.enableWhitelisting) return orig(...args); // If whitelisting is disabled, allow the notification.
-        if (!args[3]) return orig(...args); // If the showNotification function is somehow called without the proper information, allow the notification.
+        let mod = this;
+        function sendNotification() { 
+          if (mod.settings.useCustomNotificationSound || mod.settings.displayCustomToaster) {
+            if (mod.settings.useCustomNotificationSound) {
+              mod.playCustomNotification();
+            }
+            if (mod.settings.displayCustomToaster) {
+              // https://cdn.discordapp.com/avatars/990706984879812700/1168f6ade0d55236b10b0979d31e2824.webp?size=32
+              // chrome.notifications.onButtonClicked.addListener((() => { console.log(`hi`) }));
+              let notification = new Notification(args['1'], { /*buttons: [{ title: 'hi' }, { title:'there'}],*/ isClickable: true, silent: true, body: args['2'], icon: args[`0`] });
+              notification.onclick = (() => {
+                focus();
+                mod.transitionTo(`https://discord.com/channels/${args['3'].guild_id ? args['3'].guild_id : '@me'}/${args['3'].channel_id}/${args['3'].message_id}`);
+              });
+              // console.log(`args:${JSON.stringify(args)}`);
+              // notification.onclick = focus;
+              // @note service worker version (template), see comment above
+              // Notification.requestPermission().then((result) => {
+              //   if (result === "granted") {
+              //     navigator.serviceWorker.ready.then((registration) => {
+              //       registration.showNotification("Howdy hey", {
+              //         body: "Jeeeehaaaw",
+              //         icon: `https://cdn.discordapp.com/avatars/${args['4'].messageRecord.author.id}/${args['4'].messageRecord.author.avatar}.webp?size=128`,
+              //         actions: [
+              //           {
+              //             action: 'reomveFromWhitelist',
+              //             title: 'Un-whitelist',
+              //           },
+              //           {
+              //             action: 'enableFocusMode',
+              //             title: 'Enable focus mode',
+              //           },
+              //         ],
+              //       });
+              //     });
+              //   }
+              // });
+            }
+            return new Promise((resolve) => {
+              resolve();
+            });
+          } else {
+            return orig(...args);
+          }
+        }
+        if (!this.settings.enableWhitelisting) return sendNotification(); // If whitelisting is disabled, allow the notification.
+        if (!args[3]) return sendNotification(); // If the showNotification function is somehow called without the proper information, allow the notification.
 
         const notif = args[3];
 
@@ -218,22 +302,22 @@ module.exports = class {
           !notif.channel_id &&
           !notif.guild_id
         )
-          return orig(...args); // If the notification is not for a channel or server (e.g. friend requests) and such notifications are allowed, allow the notification.
+          return sendNotification(); // If the notification is not for a channel or server (e.g. friend requests) and such notifications are allowed, allow the notification.
 
         if (!this.settings.filterDMs && this.isDMOrGroupDM(notif.channel_id))
-          return orig(...args); // If the notification is a DM or group DM and DMs aren't filtered, allow the notification.
+          return sendNotification(); // If the notification is a DM or group DM and DMs aren't filtered, allow the notification.
 
         // If channel is blacklisted, skip all whitelist checks
         if (!this.isBlacklisted(notif.channel_id, notif.guild_id)) {
           if (this.settings.channelWhitelist.includes(notif.channel_id))
-            return orig(...args); // If the channel is whitelisted, allow the notification.
+            return sendNotification(); // If the channel is whitelisted, allow the notification.
           if (
             notif.guild_id &&
             this.settings.serverWhitelist.includes(notif.guild_id)
           )
-            return orig(...args); // If the server is whitelisted, allow the notification.
+            return sendNotification(); // If the server is whitelisted, allow the notification.
           if (notif.guild_id && this.guildInFolderWhitelist(notif.guild_id))
-            return orig(...args); // If the folder is whitelisted, allow the notification.
+            return sendNotification(); // If the folder is whitelisted, allow the notification.
         }
         BdApi.Logger.debug(
           "NotificationWhitelist",
@@ -383,6 +467,23 @@ module.exports = class {
     this.saveSettings();
   }
 
+  
+  _playCustomNotification_arrayBuffer = undefined;
+  /** Plays audio from this.settings.customNotificationSoundBytes, provided by the user */
+  playCustomNotification() {
+    if (!this._playCustomNotification_arrayBuffer) { this._playCustomNotification_arrayBuffer = stringToArrayBuffer(this.settings.customNotificationSoundBytes); }
+    playByteArrayAsAudio(this._playCustomNotification_arrayBuffer);
+  }
+
+  _transitionTo_nativeFunc = undefined;
+  /**
+   * @param {String} url 
+   */
+  transitionTo(url) {
+    if (!this._transitionTo_nativeFunc) { this._transitionTo_nativeFunc = BdApi.Webpack.getModule(m => m?.toString?.().includes(`"transitionTo - Transitioning to "`), { searchExports: true }); }
+    this._transitionTo_nativeFunc(url,'');
+  }
+
   getSettingsPanel() {
     return BdApi.UI.buildSettingsPanel({
       settings: [
@@ -455,6 +556,50 @@ module.exports = class {
               }
             );
           },
+        },
+        /* custom notification sound */
+        {
+          type: "switch",
+          id: "useCustomNotificationSound",
+          name: "Use custom notification sound",
+          note: "Plays an audio file whenever a notification is received instead of the default notification sound. Enabling this will also disable other default notification behavior, such as a desktop toaster showing up.",
+          value: this.settings.useCustomNotificationSound,
+          onChange: ((value) => {
+            this.settings.useCustomNotificationSound = value;
+            this.saveSettings();
+          }).bind(this),
+        },
+        {
+          type: "button",
+          id: "pickCustomNotificationSoundFilePath",
+          name: "Pick custom notification sound",
+          note: "Only relevant if 'Use custom notification sound' is enabled.",
+          children: "Pick custom notification sound",
+          color: BdApi.Components.Button.Colors.BLUE,
+          size: BdApi.Components.Button.Sizes.SMALL,
+          onClick: async () => {
+            /** @type {FileSystemFileHandle} */
+            let fileHandle;
+            [fileHandle] = await window.showOpenFilePicker();
+            let fileData = await fileHandle.getFile();
+            let audioBytes = await fileData.arrayBuffer();
+            this.settings.customNotificationSoundBytes = arrayBufferToString(new Uint8Array(audioBytes));
+            this.saveSettings();
+            this._playCustomNotification_arrayBuffer = undefined; /* Makes sure we use the new audio */
+            this.playCustomNotification();
+          },
+        },
+        /* display custom toaster */
+        {
+          type: "switch",
+          id: "displayCustomToaster",
+          name: "Display custom desktop notification/toaster",
+          note: "Enabling this will also disable other default notification behavior, such as the default Discord notification sound.",
+          value: this.settings.displayCustomToaster,
+          onChange: ((value) => {
+            this.settings.displayCustomToaster = value;
+            this.saveSettings();
+          }).bind(this),
         },
       ],
       onChange: this.saveSettings.bind(this),
